@@ -26,18 +26,25 @@ python fetch_data.py
 python finetune.py --input_data ./book_data.json --batch_size=64 --micro_batch_size=16 --num_steps=300
 ```
 
-#### Inferece
-
-```bash
-python infer_llm.py
-```
+#### Inference
 
 For inference, you can either provide a input prompt, or the model will take a default prompt
+
+##### Without user provided prompt
+
+```bash
+python inference.py --infer
+```
+
+##### Using your own prompt for inference
+
+```bash
+python inference.py --infer --prompt "my prompt"
 
 ##### Benchmark Inference
 
 ```bash
-python infer_llm.py --bench
+python inference.py --bench
 ```
 <b id="f1">1:</b> adapted from: [source](https://github.com/modal-labs/doppel-bot/blob/main/src/finetune.py) [↩](#a1)  
 <b id="f2">2:</b> adapted from: [source](https://github.com/tloen/alpaca-lora/blob/65fb8225c09af81feb5edb1abb12560f02930703/finetune.py) [↩](#a2)
