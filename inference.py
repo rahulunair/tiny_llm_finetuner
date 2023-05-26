@@ -1,5 +1,8 @@
+import gc
 import time
 import warnings
+import statistics
+
 
 warnings.filterwarnings("ignore", category=UserWarning, module="intel_extension_for_pytorch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.io.image", lineno=13)
@@ -36,49 +39,67 @@ class InferenceModel:
         checkpoint = torch.load(CHECKPOINT_PATH)
         set_peft_model_state_dict(self.model, checkpoint)
         self.model.to(DEVICE)
-        self.model.eval()
+        self.model = ipex.optimize(model=self.model.eval(), dtype=torch.bfloat16)
+        self.max_length = 100
 
-    def generate(self, input, max_length=100, **kwargs):
+    def generate(self, input, **kwargs):
         prompt = self.tokenizer.encode(input, add_special_tokens=False)
         inputs = torch.tensor([prompt], dtype=torch.long).to(DEVICE)
         with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=inputs,
-                do_sample=True,
-                max_length=max_length,
-                temperature=0.3,
-                top_p=0.85,
-                top_k=40,
-                num_beams=1,
-                repetition_penalty=1.2,
-            )
+            with torch.xpu.amp.autocast():
+                outputs = self.model.generate(
+                    input_ids=inputs,
+                    do_sample=True,
+                    max_length=self.max_length,
+                    temperature=0.8,
+                    top_p=0.9,
+                    top_k=50,
+                    num_beams=5,
+                    repetition_penalty=1.2,
+                )
         generated = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         return generated
 
-    def benchmark(self, num_runs=10):
+    def benchmark(self, num_runs=12, num_warmup=3):
         benchmark_input = "Tell me about alpacas."
-        total_time = 0
-        for _ in range(num_runs):
+        times = []
+        for _ in range(num_warmup):
+            self.generate(benchmark_input)
+        for i in range(num_runs):
             start_time = time.time()
-            _ = self.generate(benchmark_input, max_length=100)
+            self.generate(benchmark_input)
             end_time = time.time()
-
-        avg_time = total_time / num_runs
+            if not i < 2:
+                times.append(end_time - start_time)
+        avg_time = statistics.mean(times)
+        min_time = min(times)
+        max_time = max(times)
+        std_dev_time = statistics.stdev(times) if len(times) > 1 else 0
+        print(f"Model: {self.model.__class__.__name__}")
+        print(f"Device: {DEVICE}")
+        print(f"Data type: FP16")
+        print(f"Max tokens: {self.max_length}")
         print(f"Average time over {num_runs} runs: {avg_time} seconds")
+        print(f"Min time over {num_runs} runs: {min_time} seconds")
+        print(f"Max time over {num_runs} runs: {max_time} seconds")
+        print(f"Standard deviation over {num_runs} runs: {std_dev_time} seconds")
 
 
-def main(user_prompt=None, infer=True, bench=False):
+def main(user_prompt=None, infer=False, bench=False):
+    torch.xpu.empty_cache()
+    gc.collect()
     model = InferenceModel()
     prompts = [
-        "Explain the social significance of a ball in Regency England.",
-        "Describe the character traits of Elizabeth Bennet.",
-        "How does Mr. Darcy's opinion of Elizabeth Bennet change throughout the novel?",
-        "What is the role of marriage in Pride and Prejudice?",
-        "Describe the relationship between Mr. Bingley and Jane Bennet.",
-        "What is the impact of class and status in Pride and Prejudice?",
-        "How do the different marriages in the novel comment on society at the time?",
-        "What is the importance of first impressions in Pride and Prejudice?",
-        "Tell me about alpacas.",
+        "The social significance of a ball in Regency England.",
+        "The character traits of Elizabeth Bennet are.",
+        "Mr. Darcy's opinion of Elizabeth Bennet change throughout the novel",
+        "The role of marriage in Pride and Prejudice?",
+        "The relationship between Mr. Bingley and Jane Bennet.",
+        "The impact of class and status in Pride and Prejudice?",
+        "The different marriages in the novel comment on society at the time?",
+        "The importance of first impressions in Pride and Prejudice?",
+        "Let me tell me about alpacas.",
+        "python code to find primes using recursion",
     ]
     if infer:
         if user_prompt is not None:
@@ -86,15 +107,12 @@ def main(user_prompt=None, infer=True, bench=False):
         for prompt in prompts:
             print(f"user given prompt: {prompt}")
             start_time = time.time()
-            output = model.generate(prompt, max_length=100)
+            output = model.generate(prompt)
             end_time = time.time()
             print(f"\nbot response: {output}\n")
             print(f"infer time: {end_time - start_time} seconds\n")
     if bench:
-        start_time = time.time()
         model.benchmark()
-        end_time = time.time()
-        print(f"bench time: {end_time - start_time} seconds\n")
 
 
 if __name__ == "__main__":
