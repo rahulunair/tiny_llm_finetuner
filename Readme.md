@@ -42,6 +42,7 @@ python inference.py --infer
 
 ```bash
 python inference.py --infer --prompt "my prompt"
+```
 
 ##### Benchmark Inference
 
