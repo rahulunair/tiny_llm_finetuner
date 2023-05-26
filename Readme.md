@@ -1,6 +1,6 @@
 ### Finetuning openLLAMA on Intel GPUS
 
-A simple finetuner<sup id="a1">[1](#f1)</sup> <sup id="a2">[2](#f2)</sup> for LLMs on Intel XPU devices, with which you could finetune the openLLAMA model to sound like your favorite book.
+A finetuner<sup id="a1">[1](#f1)</sup> <sup id="a2">[2](#f2)</sup> for LLMs on Intel XPU devices, with which you could finetune the openLLaMA-3b model to sound like your favorite book.
 
 ![image](https://github.com/rahulunair/tiny_llm_finetuning/assets/786476/f060f4f4-f85e-42e5-82c7-fb95fad932fd)
 
