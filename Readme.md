@@ -19,7 +19,7 @@ conda env create -f env.yml
 conda activate pyt_llm_xpu
 ```
 
-**Warning**: If you PyTorch and intel extension for PyTorch already setup, then install peft without dependencies as peft requires PyTorch 2.0(not supported yet on Intel XPU devices.)
+**Warning**: OncePyTorch and intel extension for PyTorch is already setup, then install peft without dependencies as peft requires PyTorch 2.0(not supported yet on Intel XPU devices.)
 
 #### Generate data
 
