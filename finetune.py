@@ -1,223 +1,209 @@
+import logging
 import os
 from math import ceil
-from typing import Optional
+from typing import Optional, Tuple
 import warnings
 
-warnings.filterwarnings("ignore", category=UserWarning, module="intel_extension_for_pytorch")
-warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.io.image", lineno=13)
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module="intel_extension_for_pytorch"
+)
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module="torchvision.io.image", lineno=13
+)
 
-import intel_extension_for_pytorch as ipex
 import torch
+import intel_extension_for_pytorch as ipex
 from datasets import load_dataset
+from datasets import Dataset
+from bigdl.llm.transformers import AutoModelForCausalLM
+from bigdl.llm.transformers.qlora import (
+    get_peft_model,
+    prepare_model_for_kbit_training as prepare_model,
+)
+import wandb
 from fire import Fire
-from peft import (LoraConfig, get_peft_model, get_peft_model_state_dict,
-                  set_peft_model_state_dict)
-from transformers import (DataCollatorForSeq2Seq, LlamaForCausalLM,
-                          LlamaTokenizer, Trainer, TrainingArguments)
+from peft import LoraConfig
+from transformers import (
+    DataCollatorForSeq2Seq,
+    LlamaTokenizer,
+    Trainer,
+    TrainingArguments,
+)
+
+logging.basicConfig(level=logging.INFO)
+wandb.init(project="LLM-FineTuning")
 
 
+# TODO: Move these to a config file later
+BASE_MODEL = "openlm-research/open_llama_3b"
+MODEL_PATH = "./model"
 DEVICE = torch.device("xpu" if torch.xpu.is_available() else "cpu")
-print(f"Finetuning on device: {ipex.xpu.get_device_name()}")
-
-def get_device(self):
-    if torch.xpu.is_available():
-        return DEVICE
-    else:
-        return self.device
-
-
-def place_model_on_device(self):
-    self.model.to(self.args.device)
+LORA_CONFIG = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "k_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
 
 
-TrainingArguments.device = property(get_device, TrainingArguments.device.setter)
-Trainer.place_model_on_device = place_model_on_device
+def generate_prompt_book(text: str):
+    return f"""You are an AI trained in the style of classic literature. 
+
+### Text:
+{text}
+
+### Response:"""
 
 
 class FineTuner:
-    """
-    A class to handle fine tuning of an LLM model.
-    """
+    """A class to handle the fine-tuning of LLM models."""
 
-    MODEL_PATH = "./model"
-    BASE_MODEL = "openlm-research/open_llama_3b_600bt_preview"
+    def __init__(self, base_model_id: str, model_path: str, device: torch.device):
+        """
+        Initialize the FineTuner with base model, model path, and device.
 
-    def __init__(self, base_model=BASE_MODEL, model_path=MODEL_PATH, device=DEVICE):
-        self.base_model = base_model
+        Parameters:
+            base_model (str): The pre-trained model to use for fine-tuning.
+            model_path (str): Path to save the fine-tuned model.
+            device (torch.device): Device to run the model on.
+        """
+        self.base_model_id = base_model_id
         self.model_path = model_path
         self.device = device
 
-    @staticmethod
-    def download_models():
-        """
-        Downloads and saves models.
-        """
-        model = LlamaForCausalLM.from_pretrained(FineTuner.BASE_MODEL)
-        model.save_pretrained(FineTuner.MODEL_PATH)
-        tokenizer = LlamaTokenizer.from_pretrained(FineTuner.BASE_MODEL)
-        tokenizer.save_pretrained(FineTuner.MODEL_PATH)
-
-    @staticmethod
-    def tokenize(tokenizer, prompt, add_eos_token=True, cutoff_len=512):
-        """
-        Tokenizes input using provided tokenizer.
-        """
-        result = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=cutoff_len,
-            padding=False,
-            return_tensors=None,
-        )
-        if (
-            result["input_ids"][-1] != tokenizer.eos_token_id
-            and len(result["input_ids"]) < cutoff_len
-            and add_eos_token
-        ):
-            result["input_ids"].append(tokenizer.eos_token_id)
-            result["attention_mask"].append(1)
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    @staticmethod
-    def generate_and_tokenize_prompt(tokenizer, data_point):
-        """
-        Generates and tokenizes a prompt.
-        """
-        return FineTuner.tokenize(tokenizer, data_point["text"])
-
-    @staticmethod
-    def prepare_data(tokenizer, data, val_set_size):
-        """
-        Prepares data for training and evaluation.
-        """
-
-        def _prepare(dataset):
-            return dataset.map(
-                lambda x: FineTuner.generate_and_tokenize_prompt(tokenizer, x)
+    def setup_models(self):
+        """Setup download and save base models."""
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.base_model_id,
+                load_in_low_bit="nf4",
+                optimize_model=True,
+                torch_dtype=torch.float16,
+                modules_to_not_convert=["lm_head"],
             )
+            self.tokenizer = LlamaTokenizer.from_pretrained(self.base_model_id)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-        if val_set_size > 0:
-            train_val = data["train"].train_test_split(
+        except Exception as e:
+            logging.error(f"Error in downloading models: {e}")
+
+    def tokenize_batch(self, data_points, add_eos_token=True, cutoff_len=512) -> dict:
+        """Tokenize a batch of text."""
+        try:
+            texts = data_points["text"]
+            structured_prompts = [generate_prompt_book(text) for text in texts]
+            results = self.tokenizer(
+                structured_prompts,
+                truncation=True,
+                max_length=cutoff_len,
+                padding=False,
+                return_tensors=None,
+            )
+            if add_eos_token:
+                for i, tokens in enumerate(results["input_ids"]):
+                    if len(tokens) < cutoff_len:
+                        tokens.append(self.tokenizer.eos_token_id)
+                        results["attention_mask"][i].append(1)
+            results["labels"] = [ids.copy() for ids in results["input_ids"]]
+            return results
+        except Exception as e:
+            logging.error(
+                f"Error in batch tokenization: {e}, Line: {e.__traceback__.tb_lineno}"
+            )
+            raise e
+
+    def prepare_data(self, data, val_set_size=100) -> Dataset:
+        """Prepare training and validation datasets."""
+        try:
+            train_val_split = data["train"].train_test_split(
                 test_size=val_set_size, shuffle=True, seed=42
             )
-            return _prepare(train_val["train"]), _prepare(train_val["test"])
-        else:
-            return _prepare(data["train"]), None
+            train_data = train_val_split["train"].map(
+                lambda x: self.tokenize_batch(x), batched=True
+            )
+            val_data = train_val_split["test"].map(
+                lambda x: self.tokenize_batch(x), batched=True
+            )
+            return train_data, val_data
+        except Exception as e:
+            logging.error(
+                f"Error in preparing data: {e}, Line: {e.__traceback__.tb_lineno}"
+            )
+            raise e
 
-    def train_model(
-        self,
-        data,
-        output_dir="./lora-alpaca",
-        eval_steps=20,
-        save_steps=20,
-        batch_size=16,
-        micro_batch_size=2,
-        max_steps=200,
-        learning_rate=3e-4,
-        val_set_size=100,
-        lora_r=16,
-        lora_alpha=16,
-        lora_dropout=0.05,
-        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        group_by_length=True,
-        resume_from_checkpoint=None,
-    ):
+    def train_model(self, train_data, val_data, training_args):
         """
-        Fine-tunes the model with given parameters.
+        Fine-tune the model with the given training and validation data.
+
+        Parameters:
+            train_data (Dataset): Training dat        tokenizer = AutoTokenizer.from_pretrained(self.base_model)a.
+            val_data (Optional[Dataset]): Validation data.
+            training_args (TrainingArguments): Training configuration.
         """
-        gradient_accumulation_steps = batch_size // micro_batch_size
-        model = LlamaForCausalLM.from_pretrained(self.base_model)
-        tokenizer = LlamaTokenizer.from_pretrained(self.base_model, add_eos_token=True)
-        tokenizer.pad_token_id = 0
-        tokenizer.padding_side = "left"
-        config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, config).to(self.device)
-        if resume_from_checkpoint:
-            checkpoint_name = os.path.join(resume_from_checkpoint, "pytorch_model.bin")
-            if not os.path.exists(checkpoint_name):
-                checkpoint_name = os.path.join(
-                    resume_from_checkpoint, "adapter_model.bin"
-                )
-                resume_from_checkpoint = False
-            if os.path.exists(checkpoint_name):
-                adapters_weights = torch.load(checkpoint_name)
-                set_peft_model_state_dict(model, adapters_weights)
-        train_data, val_data = self.prepare_data(tokenizer, data, val_set_size)
-        trainer = Trainer(
-            model=model.to(self.device),
-            train_dataset=train_data,
-            eval_dataset=val_data,
-            args=TrainingArguments(
-                per_device_train_batch_size=micro_batch_size,
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                warmup_steps=100,
-                max_steps=max_steps,
-                learning_rate=learning_rate,
-                fp16=False,
-                logging_steps=10,
-                optim="adamw_torch",
-                evaluation_strategy="steps" if val_set_size > 0 else "no",
-                save_strategy="steps",
-                eval_steps=eval_steps if val_set_size > 0 else None,
-                save_steps=save_steps,
-                output_dir=output_dir,
-                load_best_model_at_end=False,
-                ddp_find_unused_parameters=None,
-                group_by_length=group_by_length,
-                report_to="none",
-                run_name=None,
-                use_ipex=True,
-            ),
-            data_collator=DataCollatorForSeq2Seq(
-                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-            ),
-        )
-        model.config.use_cache = False
-        old_state_dict = model.state_dict
-        model.state_dict = (
-            lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
-        ).__get__(model, type(model))
-        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-        model.save_pretrained(output_dir)
+        try:
+            self.model = self.model.to(DEVICE)
+            self.model.gradient_checkpointing_enable()
+            self.model = prepare_model(self.model)
+            self.model = get_peft_model(self.model, LORA_CONFIG)
+            trainer = Trainer(
+                model=self.model,
+                train_dataset=train_data,
+                eval_dataset=val_data,
+                args=training_args,
+                data_collator=DataCollatorForSeq2Seq(
+                    self.tokenizer,
+                    pad_to_multiple_of=8,
+                    return_tensors="pt",
+                    padding=True,
+                ),
+            )
+            self.model.config.use_cache = False
+            trainer.train()
+            self.model.save_pretrained(self.model_path)
+        except Exception as e:
+            logging.error(f"Error in model training: {e}")
 
-    def finetune(
-        self,
-        input_data_path: str,
-        batch_size: Optional[int] = 16,
-        micro_batch_size: Optional[int] = 2,
-        max_steps: Optional[int] = 200,
-        learning_rate: Optional[float] = 3e-4,
-        val_set_size_ratio: Optional[float] = 0.1,
-    ):
-        data = load_dataset("json", data_files=input_data_path)
-        num_samples = len(data["train"])
-        val_set_size = ceil(val_set_size_ratio * num_samples)
-        self.train_model(
-            data=data,
-            val_set_size=val_set_size,
-            batch_size=batch_size,
-            micro_batch_size=micro_batch_size,
-            max_steps=max_steps,
-            learning_rate=learning_rate,
-        )
+    def finetune(self, data_path, training_args):
+        """
+        Execute the fine-tuning pipeline.
 
-
-def main(input_data,batch_size=16,micro_batch_size=2,max_steps=200,learning_rate=3e-4,val_set_size_ratio=0.1):
-    """
-    Main function to initiate the finetuning process.
-    """
-    finetuner = FineTuner()
-    finetuner.download_models()
-    finetuner.finetune(input_data, batch_size, micro_batch_size, max_steps, learning_rate, val_set_size_ratio)
+        Parameters:
+            data_path (str): Path to the data for fine-tuning.
+            training_args (TrainingArguments): Training configuration.
+        """
+        self.setup_models()
+        data = load_dataset("json", data_files=data_path)
+        train_data, val_data = self.prepare_data(data)
+        self.train_model(train_data, val_data, training_args)
 
 
 if __name__ == "__main__":
-    Fire(main)
+    print(f"Finetuning on device: {ipex.xpu.get_device_name()}")
+    try:
+        finetuner = FineTuner(
+            base_model_id=BASE_MODEL, model_path=MODEL_PATH, device=DEVICE
+        )
+        training_args = TrainingArguments(
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=4,
+            save_steps=100,
+            warmup_steps=20,
+            # max_steps=200,
+            learning_rate=2e-4,
+            num_train_epochs=3,
+            evaluation_strategy="steps",
+            eval_steps=100,
+            fp16=True,
+            logging_steps=20,
+            optim="adamw_hf",
+            output_dir="./output",
+            logging_dir="./logs",
+            report_to="wandb",
+        )
+        data_path = "./book_data.json"  # TODO: Move this to a config file later
+        finetuner.finetune(data_path, training_args)
+    except Exception as e:
+        logging.error(f"Error occurred: {e}")
